@@ -197,14 +197,11 @@ class MHTMLParser:
         """基于CSS类名精确提取消息，按时间线排列"""
         messages = []
 
-        # 简化的正则表达式，只处理用户输入和AI回复
-        user_pattern = re.compile(r'<div[^>]*class=3D"[^"]*hyc-component-text[^"]*"[^>]*>(.*?)</div>', re.DOTALL | re.IGNORECASE)
-        response_pattern = re.compile(r'<div[^>]*class=3D"[^"]*hyc-component-reasoner__text[^"]*"[^>]*>(.*?)</div>', re.DOTALL | re.IGNORECASE)
-
         # 收集所有匹配项及其位置
         all_matches = []
 
-        # 用户消息
+        # 用户消息 - 保持原有的简单逻辑
+        user_pattern = re.compile(r'<div[^>]*class=3D"[^"]*hyc-component-text[^"]*"[^>]*>(.*?)</div>', re.DOTALL | re.IGNORECASE)
         for match in user_pattern.finditer(html_content):
             content = self.extract_text_content(match.group(1))
             if self._is_valid_message(content):
@@ -214,13 +211,14 @@ class MHTMLParser:
                     'content': content
                 })
 
-        # AI回复内容
-        for match in response_pattern.finditer(html_content):
-            content = self.extract_text_content(match.group(1))
+        # AI回复内容 - 使用递归方法提取完整的嵌套内容
+        response_divs = self._extract_nested_div_content(html_content, 'hyc-component-reasoner__text')
+        for start_pos, full_content in response_divs:
+            content = self.extract_text_content(full_content)
             if self._is_valid_message(content):
                 all_matches.append({
                     'type': 'assistant',
-                    'position': match.start(),
+                    'position': start_pos,
                     'content': content
                 })
 
@@ -235,6 +233,50 @@ class MHTMLParser:
             ))
 
         return messages
+
+    def _extract_nested_div_content(self, html_content: str, class_name: str) -> List[Tuple[int, str]]:
+        """提取指定class的div完整内容，包括所有嵌套的子元素"""
+        results = []
+
+        # 构建匹配模式
+        pattern = re.compile(r'<div[^>]*class=3D"[^"]*' + re.escape(class_name) + r'[^"]*"[^>]*>', re.IGNORECASE)
+
+        for match in pattern.finditer(html_content):
+            start_pos = match.start()
+            div_start = match.end()
+
+            # 找到对应的结束标签，考虑嵌套结构
+            nesting_level = 1
+            current_pos = div_start
+            content_end = div_start
+
+            while nesting_level > 0 and current_pos < len(html_content):
+                # 查找下一个标签
+                open_div_match = re.search(r'<div[^>]*>', html_content[current_pos:], re.IGNORECASE)
+                close_div_match = re.search(r'</div>', html_content[current_pos:])
+
+                if not open_div_match and not close_div_match:
+                    break
+
+                if open_div_match and (not close_div_match or open_div_match.start() < close_div_match.start()):
+                    # 找到开标签，增加嵌套层级
+                    nesting_level += 1
+                    current_pos += open_div_match.end()
+                else:
+                    # 找到闭标签，减少嵌套层级
+                    nesting_level -= 1
+                    if nesting_level == 0:
+                        # 找到了匹配的结束标签
+                        content_end = current_pos + close_div_match.start()
+                        break
+                    current_pos += close_div_match.end()
+
+            # 提取完整的内部内容
+            if content_end > div_start:
+                full_content = html_content[div_start:content_end]
+                results.append((start_pos, full_content))
+
+        return results
 
     def _extract_by_patterns(self, content: str) -> List[ChatMessage]:
         """基于模式匹配提取消息"""
