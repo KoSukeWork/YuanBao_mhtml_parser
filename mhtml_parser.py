@@ -11,6 +11,7 @@
 
 import re
 import email
+import email.message
 import quopri
 import urllib.parse
 from typing import Dict, List, Optional, Tuple
@@ -27,7 +28,6 @@ class ChatMessage:
     sender: str  # 发送者 (user/assistant)
     content: str  # 消息内容
     timestamp: Optional[str] = None
-    thinking: Optional[str] = None  # AI思考过程
 
 
 @dataclass
@@ -54,9 +54,10 @@ class MHTMLParser:
 
         # 腾讯元宝聊天内容特征模式
         self.chat_patterns = {
-            'message_container': re.compile(r'hyc-content-md.*?</div>', re.DOTALL | re.IGNORECASE),
-            'thinking_process': re.compile(r'已深度思考.*?</div>', re.DOTALL | re.IGNORECASE),
-            'user_message': re.compile(r'user.*?assistant', re.DOTALL | re.IGNORECASE),
+            # AI正式回复内容
+            'ai_response': re.compile(r'<div[^>]*class=3D"[^"]*hyc-component-reasoner__text[^"]*"[^>]*>(.*?)</div>', re.DOTALL | re.IGNORECASE),
+            # 用户输入内容
+            'user_input': re.compile(r'<div[^>]*class=3D"[^"]*hyc-component-text[^"]*"[^>]*>(.*?)</div>', re.DOTALL | re.IGNORECASE),
         }
 
     def decode_quoted_printable(self, text: str) -> str:
@@ -131,7 +132,22 @@ class MHTMLParser:
         """提取会话基本信息"""
         # 提取标题
         subject = msg.get('Subject', '')
-        title = self.decode_quoted_printable(subject) if subject else "未知对话"
+        if subject:
+            # 处理多行编码的标题
+            import email.header
+            decoded_parts = email.header.decode_header(subject)
+            title_parts = []
+            for part, encoding in decoded_parts:
+                if isinstance(part, bytes):
+                    if encoding:
+                        title_parts.append(part.decode(encoding))
+                    else:
+                        title_parts.append(part.decode('utf-8', errors='ignore'))
+                else:
+                    title_parts.append(part)
+            title = ''.join(title_parts)
+        else:
+            title = "未知对话"
 
         # 提取URL
         url = msg.get('Snapshot-Content-Location', '')
@@ -163,17 +179,62 @@ class MHTMLParser:
         """解析聊天消息"""
         messages = []
 
-        # 先解码整个HTML内容
-        decoded_html = self.extract_text_content(html_content)
+        # 使用CSS类名精确提取消息
+        messages = self._extract_by_css_classes(html_content)
 
-        # 使用多种策略提取消息
-        messages.extend(self._extract_by_patterns(decoded_html))
-        messages.extend(self._extract_by_keywords(decoded_html))
+        # 如果CSS类名方式没有提取到内容，使用备用方法
+        if not messages:
+            decoded_html = self.extract_text_content(html_content)
+            messages.extend(self._extract_by_patterns(decoded_html))
+            messages.extend(self._extract_by_keywords(decoded_html))
 
         # 去重和排序
         unique_messages = self._deduplicate_messages(messages)
 
         return unique_messages
+
+    def _extract_by_css_classes(self, html_content: str) -> List[ChatMessage]:
+        """基于CSS类名精确提取消息，按时间线排列"""
+        messages = []
+
+        # 简化的正则表达式，只处理用户输入和AI回复
+        user_pattern = re.compile(r'<div[^>]*class=3D"[^"]*hyc-component-text[^"]*"[^>]*>(.*?)</div>', re.DOTALL | re.IGNORECASE)
+        response_pattern = re.compile(r'<div[^>]*class=3D"[^"]*hyc-component-reasoner__text[^"]*"[^>]*>(.*?)</div>', re.DOTALL | re.IGNORECASE)
+
+        # 收集所有匹配项及其位置
+        all_matches = []
+
+        # 用户消息
+        for match in user_pattern.finditer(html_content):
+            content = self.extract_text_content(match.group(1))
+            if self._is_valid_message(content):
+                all_matches.append({
+                    'type': 'user',
+                    'position': match.start(),
+                    'content': content
+                })
+
+        # AI回复内容
+        for match in response_pattern.finditer(html_content):
+            content = self.extract_text_content(match.group(1))
+            if self._is_valid_message(content):
+                all_matches.append({
+                    'type': 'assistant',
+                    'position': match.start(),
+                    'content': content
+                })
+
+        # 按位置排序以保持时间线
+        all_matches.sort(key=lambda x: x['position'])
+
+        # 转换为ChatMessage对象
+        for match_data in all_matches:
+            messages.append(ChatMessage(
+                sender=match_data['type'],
+                content=match_data['content']
+            ))
+
+        return messages
 
     def _extract_by_patterns(self, content: str) -> List[ChatMessage]:
         """基于模式匹配提取消息"""
@@ -311,10 +372,6 @@ class MHTMLParser:
             sender_label = "🧑 用户" if msg.sender == 'user' else "🤖 AI助手"
 
             markdown_content += f"## {i}. {sender_label}\n\n"
-
-            if msg.thinking:
-                markdown_content += f"*{msg.thinking}*\n\n"
-
             markdown_content += f"{msg.content}\n\n---\n\n"
 
         # 写入文件
@@ -337,7 +394,6 @@ class MHTMLParser:
                 {
                     'sender': msg.sender,
                     'content': msg.content,
-                    'thinking': msg.thinking,
                     'timestamp': msg.timestamp
                 }
                 for msg in session.messages
